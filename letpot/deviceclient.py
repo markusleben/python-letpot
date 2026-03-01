@@ -24,10 +24,12 @@ from letpot.exceptions import (
 )
 from letpot.models import (
     AuthenticationInfo,
+    CycleWateringMode,
     DeviceFeature,
     LetPotDeviceInfo,
     LetPotDeviceStatus,
     LetPotGardenStatus,
+    LetPotWateringSystemStatus,
     LightMode,
     TemperatureUnit,
 )
@@ -87,24 +89,34 @@ class LetPotDeviceClient:
     BROKER_HOST = "broker.letpot.net"
     MTU = 128
 
-    _client: aiomqtt.Client | None = None
-    _client_task: asyncio.Task | None = None
-    _connected: asyncio.Future[bool] | None = None
-    _topics: list[str] = []
-    _message_id: int = 0
+    _client: aiomqtt.Client | None
+    _client_task: asyncio.Task | None
+    _connected: asyncio.Future[bool] | None
+    _topics: list[str]
+    _message_id: int
 
     _user_id: str
     _email: str
 
-    _device_callbacks: dict[str, Callable[[LetPotDeviceStatus], None]] = {}
-    _device_status_last: dict[str, LetPotDeviceStatus | None] = {}
-    _device_status_pending: dict[str, LetPotDeviceStatus | None] = {}
-    _device_status_timeout: dict[str, asyncio.Task | None] = {}
-    _device_status_event: dict[str, asyncio.Event | None] = {}
+    _device_callbacks: dict[str, Callable[[LetPotDeviceStatus], None]]
+    _device_status_last: dict[str, LetPotDeviceStatus | None]
+    _device_status_pending: dict[str, LetPotDeviceStatus | None]
+    _device_status_timeout: dict[str, asyncio.Task | None]
+    _device_status_event: dict[str, asyncio.Event | None]
 
     def __init__(self, info: AuthenticationInfo) -> None:
         self._user_id = info.user_id
         self._email = info.email
+        self._client = None
+        self._client_task = None
+        self._connected = None
+        self._topics = []
+        self._message_id = 0
+        self._device_callbacks = {}
+        self._device_status_last = {}
+        self._device_status_pending = {}
+        self._device_status_timeout = {}
+        self._device_status_event = {}
 
     def _converter(self, serial: str) -> LetPotDeviceConverter:
         """Get the device converter for the current serial number."""
@@ -225,7 +237,7 @@ class LetPotDeviceClient:
             except asyncio.CancelledError:
                 pass
         self._device_status_pending[serial] = status
-        self._device_status_timeout[serial] = asyncio.get_event_loop().create_task(
+        self._device_status_timeout[serial] = asyncio.get_running_loop().create_task(
             self._clear_pending_status(serial)
         )
         await self._publish(
@@ -271,6 +283,9 @@ class LetPotDeviceClient:
 
                     async for message in client.messages:
                         self._handle_message(message)
+            except asyncio.CancelledError:
+                _LOGGER.debug("MQTT connection task cancelled")
+                raise
             except aiomqtt.MqttError as err:
                 self._client = None
 
@@ -294,6 +309,19 @@ class LetPotDeviceClient:
                         err,
                     )
                     await asyncio.sleep(reconnect_interval)
+            except Exception as err:
+                # Intentionally no immediate retry for unknown errors (unlike MqttError);
+                # the _connected Future is handled by the finally block.
+                self._client = None
+                connection_attempts += 1
+                reconnect_interval = min(connection_attempts * 15, 600)
+                _LOGGER.warning(
+                    "Unexpected MQTT error, retrying in %i seconds: %s",
+                    reconnect_interval,
+                    err,
+                    exc_info=True,
+                )
+                await asyncio.sleep(reconnect_interval)
             finally:
                 self._client = None
                 if self._connected is not None:
@@ -312,6 +340,21 @@ class LetPotDeviceClient:
                 await self._client_task
             except asyncio.CancelledError:
                 _LOGGER.debug("MQTT task succesfully shutdown")
+
+    async def reconnect(self) -> None:
+        """Force reconnection by cancelling the current connection and starting a new one."""
+        if not self._topics:
+            return
+
+        _LOGGER.info("Forcing MQTT reconnection")
+        await self._disconnect()
+
+        # Re-establish connection; _connect() restores subscriptions from self._topics
+        self._connected = asyncio.get_running_loop().create_future()
+        self._client_task = asyncio.create_task(self._connect())
+        result = await self._connected
+        if not result:
+            raise LetPotConnectionException("Reconnection failed")
 
     # endregion
 
@@ -332,7 +375,7 @@ class LetPotDeviceClient:
                 )
             )
         ):
-            self._connected = asyncio.get_event_loop().create_future()
+            self._connected = asyncio.get_running_loop().create_future()
             self._client_task = asyncio.create_task(self._connect())
             await self._connected
         elif not self._connected.done():
@@ -490,6 +533,71 @@ class LetPotDeviceClient:
         if not isinstance(use_status, LetPotGardenStatus):
             raise LetPotDeviceCategoryException()
         status = dataclasses.replace(use_status, water_mode=1 if on else 0)
+        await self._publish_status(serial, status)
+
+    @requires_feature(DeviceFeature.CATEGORY_WATERING_SYSTEM)
+    async def set_pump_manual_duration(self, serial: str, minutes: int) -> None:
+        """Set the manual watering duration for this device (in minutes)."""
+        use_status = self._get_publish_status(serial)
+        if not isinstance(use_status, LetPotWateringSystemStatus):
+            raise LetPotDeviceCategoryException()
+        status = dataclasses.replace(use_status, pump_manual_duration=minutes)
+        await self._publish_status(serial, status)
+
+    @requires_feature(DeviceFeature.CATEGORY_WATERING_SYSTEM)
+    async def set_pump_cycle_on(self, serial: str, on: bool) -> None:
+        """Set cycle watering for this device (on/off)."""
+        use_status = self._get_publish_status(serial)
+        if not isinstance(use_status, LetPotWateringSystemStatus):
+            raise LetPotDeviceCategoryException()
+        status = dataclasses.replace(use_status, pump_cycle_on=on)
+        await self._publish_status(serial, status)
+
+    @requires_feature(DeviceFeature.CATEGORY_WATERING_SYSTEM)
+    async def set_pump_cycle_frequency(self, serial: str, hours: int) -> None:
+        """Set the cycle watering frequency for this device (in hours)."""
+        use_status = self._get_publish_status(serial)
+        if not isinstance(use_status, LetPotWateringSystemStatus):
+            raise LetPotDeviceCategoryException()
+        status = dataclasses.replace(use_status, pump_cycle_frequency=hours)
+        await self._publish_status(serial, status)
+
+    @requires_feature(DeviceFeature.CATEGORY_WATERING_SYSTEM)
+    async def set_pump_cycle_duration(self, serial: str, minutes: int) -> None:
+        """Set the cycle watering duration for this device (in minutes)."""
+        use_status = self._get_publish_status(serial)
+        if not isinstance(use_status, LetPotWateringSystemStatus):
+            raise LetPotDeviceCategoryException()
+        status = dataclasses.replace(use_status, pump_cycle_duration=minutes)
+        await self._publish_status(serial, status)
+
+    @requires_feature(DeviceFeature.CATEGORY_WATERING_SYSTEM)
+    async def set_pump_cycle_mode(self, serial: str, mode: CycleWateringMode) -> None:
+        """Set the cycle watering mode for this device (continuous/intermittent)."""
+        use_status = self._get_publish_status(serial)
+        if not isinstance(use_status, LetPotWateringSystemStatus):
+            raise LetPotDeviceCategoryException()
+        status = dataclasses.replace(use_status, pump_cycle_mode=mode)
+        await self._publish_status(serial, status)
+
+    @requires_feature(DeviceFeature.CATEGORY_WATERING_SYSTEM)
+    async def set_pump_cycle_workinginterval(
+        self, serial: str, seconds: int
+    ) -> None:
+        """Set the intermittent cycle watering work interval for this device (in seconds)."""
+        use_status = self._get_publish_status(serial)
+        if not isinstance(use_status, LetPotWateringSystemStatus):
+            raise LetPotDeviceCategoryException()
+        status = dataclasses.replace(use_status, pump_cycle_workinginterval=seconds)
+        await self._publish_status(serial, status)
+
+    @requires_feature(DeviceFeature.CATEGORY_WATERING_SYSTEM)
+    async def set_pump_cycle_restinterval(self, serial: str, seconds: int) -> None:
+        """Set the intermittent cycle watering rest interval for this device (in seconds)."""
+        use_status = self._get_publish_status(serial)
+        if not isinstance(use_status, LetPotWateringSystemStatus):
+            raise LetPotDeviceCategoryException()
+        status = dataclasses.replace(use_status, pump_cycle_restinterval=seconds)
         await self._publish_status(serial, status)
 
     # endregion

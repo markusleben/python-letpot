@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import nullcontext
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -140,6 +140,93 @@ async def test_subscribe_callback(
     # Shutdown gracefully
     await device_client.unsubscribe(device1)
     await device_client.unsubscribe(device2)
+
+
+def test_clients_do_not_share_internal_state() -> None:
+    """Test that mutable connection state is scoped per client instance."""
+    client1 = LetPotDeviceClient(AUTHENTICATION)
+    client2 = LetPotDeviceClient(AUTHENTICATION)
+
+    callback = MagicMock()
+    client1._topics.append("LPH21ABCD/data")
+    client1._device_callbacks["LPH21ABCD"] = callback
+
+    assert client2._topics == []
+    assert client2._device_callbacks == {}
+
+
+async def test_reconnect_reestablishes_connection(
+    device_client: LetPotDeviceClient, mock_aiomqtt: MagicMock
+) -> None:
+    """Test that reconnect cancels the old connection and creates a new one."""
+    device = "LPH21ABCD"
+
+    await device_client.subscribe(device, lambda _: None)
+    assert device_client._client is not None
+    old_task = device_client._client_task
+
+    await device_client.reconnect()
+
+    # Old task should be cancelled
+    assert old_task.cancelled()
+    # New connection should be established
+    assert device_client._client is not None
+    assert device_client._client_task is not old_task
+    # Topics should still be registered
+    assert f"{device}/data" in device_client._topics
+
+    await device_client.unsubscribe(device)
+
+
+async def test_reconnect_noop_when_no_topics(
+    device_client: LetPotDeviceClient, mock_aiomqtt: MagicMock
+) -> None:
+    """Test that reconnect does nothing when there are no active subscriptions."""
+    await device_client.reconnect()
+    assert device_client._client is None
+    assert device_client._client_task is None
+
+
+async def test_connect_retries_on_non_mqtt_exception(
+    device_client: LetPotDeviceClient,
+) -> None:
+    """Test that _connect retries on non-MqttError exceptions instead of crashing."""
+    attempt_count = 0
+    retried = asyncio.Event()
+    _real_sleep = asyncio.sleep
+
+    with patch("letpot.deviceclient.aiomqtt.Client") as mock_client_class:
+        # side_effect on the AsyncMock __aenter__ to track and raise
+        def track_and_raise(*_args, **_kwargs):
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count >= 2:
+                retried.set()
+            raise ConnectionError("Network unreachable")
+
+        mock_client_class.return_value.__aenter__ = AsyncMock(
+            side_effect=track_and_raise
+        )
+
+        async def instant_sleep(_seconds):
+            await _real_sleep(0)
+
+        with patch("letpot.deviceclient.asyncio.sleep", side_effect=instant_sleep):
+            device_client._connected = asyncio.get_running_loop().create_future()
+            task = asyncio.create_task(device_client._connect())
+
+            # Wait for the retry loop to have made at least 2 attempts
+            async with asyncio.timeout(2):
+                await retried.wait()
+
+            assert attempt_count >= 2
+            assert not task.done(), "_connect task should still be running"
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 @pytest.mark.parametrize(
