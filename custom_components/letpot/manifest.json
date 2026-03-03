@@ -1,0 +1,12 @@
+{
+  "domain": "letpot",
+  "name": "LetPot",
+  "codeowners": ["@jpelgrom"],
+  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/letpot",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "loggers": ["letpot"],
+  "requirements": ["letpot @ git+https://github.com/w0nk1/python-letpot.git@ise0x-device-support"],
+  "version": "0.1.0"
+}
